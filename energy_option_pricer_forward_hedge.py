@@ -24,6 +24,11 @@ class CalibrationResult:
     jump_lambda: float
     jump_mu: float
     jump_sigma: float
+    # negative-jump parameters (downward spikes)
+    neg_jump_lambda: float
+    neg_jump_mu: float
+    neg_jump_sigma: float
+    neg_jump_cap: float
     jump_threshold_z: float
     jump_count: int
     obs_frequency_years: float
@@ -32,6 +37,9 @@ class CalibrationResult:
     spot_bump_scale: float
     sigma_bump_scale: float
     jump_cap: float
+    # declared here so dataclass tracks them properly
+    sigma_floor: float = 0.0
+    sigma_ceiling: float = 1e30
 
 
 class ElectricitySpotAsianPricer:
@@ -151,42 +159,94 @@ class ElectricitySpotAsianPricer:
 
     def _draw_jump(self, p: dict, u: np.ndarray) -> np.ndarray:
         """
-        Positive spike jump draw in price units.
+        Two-sided jump draw in price units (positive spikes + negative spikes).
 
-        Uses empirical inverse-CDF sampling from calibrated positive jump samples,
-        falling back to a positive lognormal draw if needed.
+        Positive jumps: empirical inverse-CDF from calibrated positive residuals,
+        falling back to a lognormal parametric draw.
+        Negative jumps: empirical inverse-CDF from calibrated negative residuals
+        (stored as positive magnitudes, negated on draw), falling back to a
+        normal parametric draw scaled by neg_jump_sigma.
+
+        Each simulated jump event is assigned a sign based on the relative
+        intensities lambda_pos / (lambda_pos + lambda_neg).  u is used both
+        for the sign draw and for the size quantile, keeping correlation with
+        the Poisson indicator uniform u already drawn in the simulation loop.
         """
-        samples = self.jump_samples_.get(p["regime"], None)
+        regime = p["regime"]
+        lam_pos = float(p.get("jump_lambda", 0.0))
+        lam_neg = float(p.get("neg_jump_lambda", 0.0))
+        lam_tot = lam_pos + lam_neg
+        if lam_tot <= 0.0:
+            return np.zeros_like(u, dtype=float)
 
-        if samples is not None:
-            s = np.asarray(samples, dtype=float)
-            s = s[np.isfinite(s)]
-            s = s[s > 0]
+        # Probability that a jump event is a positive spike
+        p_pos = lam_pos / lam_tot
 
-            if len(s) > 0:
-                s = np.sort(s)
-                idx = np.minimum((u * len(s)).astype(int), len(s) - 1)
-                jump = s[idx]
-                jump_cap = float(p.get("jump_cap", 0.0))
-                if np.isfinite(jump_cap) and jump_cap > 0:
-                    jump = np.clip(jump, 0.0, jump_cap)
-                return jump
+        u = np.asarray(u, dtype=float)
+        is_pos = u < p_pos
+        # Re-scale u within each half to [0,1] for size sampling
+        u_pos_size = np.where(is_pos, u / max(p_pos, np.finfo(float).eps), 0.0)
+        u_neg_size = np.where(~is_pos, (u - p_pos) / max(1.0 - p_pos, np.finfo(float).eps), 0.0)
 
-        mu = max(float(p.get("jump_mu", 0.0)), 0.0)
-        sigma = max(float(p.get("jump_sigma", 0.0)), 0.0)
-        if mu > 0.0 and sigma > 0.0:
-            var = sigma ** 2
-            sigma_ln = np.sqrt(np.log1p(var / max(mu ** 2, np.finfo(float).tiny)))
-            mu_ln = np.log(mu) - 0.5 * sigma_ln ** 2
-            z = norm.ppf(np.clip(u, np.finfo(float).eps, 1.0 - np.finfo(float).eps))
-            jump = np.exp(mu_ln + sigma_ln * z)
+        # --- positive jump sizes ---
+        pos_samples = self.jump_samples_.get(regime + "_pos", None)
+        if pos_samples is None:
+            pos_samples = self.jump_samples_.get(regime, None)
+        if pos_samples is not None:
+            s = np.asarray(pos_samples, dtype=float)
+            s = s[np.isfinite(s) & (s > 0)]
         else:
-            jump = np.zeros_like(u, dtype=float)
+            s = np.array([], dtype=float)
 
-        jump_cap = float(p.get("jump_cap", 0.0))
-        if np.isfinite(jump_cap) and jump_cap > 0:
-            jump = np.clip(jump, 0.0, jump_cap)
-        return np.maximum(jump, 0.0)
+        if len(s) > 0:
+            s = np.sort(s)
+            idx = np.minimum((u_pos_size * len(s)).astype(int), len(s) - 1)
+            pos_jump = s[idx]
+            jump_cap = float(p.get("jump_cap", 0.0))
+            if np.isfinite(jump_cap) and jump_cap > 0:
+                pos_jump = np.clip(pos_jump, 0.0, jump_cap)
+        else:
+            mu = max(float(p.get("jump_mu", 0.0)), 0.0)
+            sigma = max(float(p.get("jump_sigma", 0.0)), 0.0)
+            if mu > 0.0 and sigma > 0.0:
+                var = sigma ** 2
+                sigma_ln = np.sqrt(np.log1p(var / max(mu ** 2, np.finfo(float).tiny)))
+                mu_ln = np.log(mu) - 0.5 * sigma_ln ** 2
+                z = norm.ppf(np.clip(u_pos_size, np.finfo(float).eps, 1.0 - np.finfo(float).eps))
+                pos_jump = np.exp(mu_ln + sigma_ln * z)
+            else:
+                pos_jump = np.zeros_like(u, dtype=float)
+            jump_cap = float(p.get("jump_cap", 0.0))
+            if np.isfinite(jump_cap) and jump_cap > 0:
+                pos_jump = np.clip(pos_jump, 0.0, jump_cap)
+            pos_jump = np.maximum(pos_jump, 0.0)
+
+        # --- negative jump sizes (stored as positive magnitudes) ---
+        neg_samples = self.jump_samples_.get(regime + "_neg", None)
+        if neg_samples is not None:
+            ns = np.asarray(neg_samples, dtype=float)
+            ns = ns[np.isfinite(ns) & (ns > 0)]
+        else:
+            ns = np.array([], dtype=float)
+
+        if len(ns) > 0:
+            ns = np.sort(ns)
+            idx_n = np.minimum((u_neg_size * len(ns)).astype(int), len(ns) - 1)
+            neg_jump = -ns[idx_n]
+            neg_cap = float(p.get("neg_jump_cap", 0.0))
+            if np.isfinite(neg_cap) and neg_cap > 0:
+                neg_jump = np.clip(neg_jump, -neg_cap, 0.0)
+        else:
+            neg_mu = max(float(p.get("neg_jump_mu", 0.0)), 0.0)
+            neg_sigma = max(float(p.get("neg_jump_sigma", 0.0)), 0.0)
+            if neg_mu > 0.0 and neg_sigma > 0.0:
+                z_n = norm.ppf(np.clip(u_neg_size, np.finfo(float).eps, 1.0 - np.finfo(float).eps))
+                neg_jump = -(neg_mu + neg_sigma * z_n)
+                neg_jump = np.minimum(neg_jump, 0.0)
+            else:
+                neg_jump = np.zeros_like(u, dtype=float)
+
+        return np.where(is_pos, pos_jump, neg_jump)
 
     @staticmethod
     def _robust_mad(x: pd.Series | np.ndarray) -> float:
@@ -598,23 +658,68 @@ class ElectricitySpotAsianPricer:
         if len(sample) < 50:
             raise ValueError("Not enough data for calibration.")
 
+        # ----------------------------------------------------------------
+        # Kappa estimation: always use daily aggregated data.
+        # AR(1) on hourly data measures intra-day autocorrelation, not the
+        # multi-day OU mean-reversion speed.  Aggregating to daily before
+        # fitting kappa gives an economically meaningful half-life.
+        # ----------------------------------------------------------------
+        if use_hourly and self.hourly_ is not None:
+            s_daily = self.aggregate_hourly_to_daily(self.hourly_)["Price"].astype(float).dropna()
+        else:
+            s_daily = sample.copy()
+
+        theta_daily = pd.Series(self.theta(s_daily.index), index=s_daily.index)
+        x_daily = (s_daily - theta_daily).dropna()
+
+        # Pass 1 on daily: rough jump detection to clean kappa estimate
+        ar_rough = self._fit_ar1_residual_model(x_daily)
+        resid_rough = ar_rough["resid"].dropna().sort_index()
+        window_rough = self._effective_window(ar_rough["phi"])
+        local_scale_rough = resid_rough.rolling(window_rough, min_periods=max(3, window_rough // 3)).apply(
+            self._robust_mad, raw=False
+        )
+        local_scale_rough = local_scale_rough.replace([np.inf, -np.inf], np.nan).reindex(resid_rough.index)
+        local_scale_rough = local_scale_rough.interpolate(limit_direction="both").bfill().ffill()
+        z_rough = (resid_rough / local_scale_rough).replace([np.inf, -np.inf], np.nan).dropna()
+        z_cut_rough = float(np.sqrt(2.0 * np.log(max(len(z_rough), 2))))
+        clean_idx_rough = z_rough.index[np.abs(z_rough) <= z_cut_rough]
+        x_daily_clean = x_daily.loc[x_daily.index.intersection(clean_idx_rough)] if len(clean_idx_rough) >= 50 else x_daily
+
+        # Pass 2 on daily: unbiased kappa from jump-cleaned data
+        ar_daily = self._fit_ar1_residual_model(x_daily_clean)
+        kappa_final = float(ar_daily["kappa"])
+
+        # med_dt for obs_frequency_years stays on the original (hourly) sample
         theta_sample = pd.Series(self.theta(sample.index), index=sample.index)
         x = sample - theta_sample
-        ar = self._fit_ar1_residual_model(x)
-        resid = ar["resid"].dropna().sort_index()
-        med_dt = ar["median_dt_years"]
+
+        ar_hourly = self._fit_ar1_residual_model(x)
+        med_dt = ar_hourly["median_dt_years"]
         obs_per_year = 1.0 / med_dt
         obs_per_day = obs_per_year / self.day_count_basis
 
-        window = self._effective_window(ar["phi"])
-        local_scale = resid.rolling(window, min_periods=max(3, window // 3)).apply(self._robust_mad, raw=False)
-        local_scale = local_scale.replace([np.inf, -np.inf], np.nan).reindex(resid.index)
+        # ----------------------------------------------------------------
+        # Sigma / vol-of-vol / jump calibration: use full-frequency sample
+        # Re-compute residuals using daily kappa phi translated to hourly dt
+        # ----------------------------------------------------------------
+        phi_hourly = float(np.exp(-kappa_final * med_dt))
+        phi_hourly = float(np.clip(phi_hourly, 1e-10, 1.0 - 1e-10))
+        # Intercept: theta absorption at hourly scale
+        c_ar_hourly = float(ar_hourly["c_ar"])  # use hourly-fitted intercept for residuals
+
+        df_full = pd.concat([x.rename("x_now"), x.shift(1).rename("x_lag")], axis=1).dropna()
+        resid_full = df_full["x_now"] - (c_ar_hourly + phi_hourly * df_full["x_lag"])
+
+        window = self._effective_window(phi_hourly)
+        local_scale = resid_full.rolling(window, min_periods=max(3, window // 3)).apply(self._robust_mad, raw=False)
+        local_scale = local_scale.replace([np.inf, -np.inf], np.nan).reindex(resid_full.index)
         local_scale = local_scale.interpolate(limit_direction="both").bfill().ffill()
         sigma_series = local_scale / np.sqrt(med_dt)
         if len(sigma_series) < 3:
             raise ValueError("Not enough data to calibrate stochastic volatility.")
 
-        z = (resid / local_scale).replace([np.inf, -np.inf], np.nan).dropna()
+        z = (resid_full / local_scale).replace([np.inf, -np.inf], np.nan).dropna()
         z_cut = float(np.sqrt(2.0 * np.log(max(len(z), 2))))
         clean_idx = z.index[np.abs(z) <= z_cut]
         if len(clean_idx) < 10:
@@ -642,32 +747,53 @@ class ElectricitySpotAsianPricer:
         vol_resid = log_now - (c_s + phi_s * log_lag)
         eta = float(vol_resid.std(ddof=1) / np.sqrt(med_dt)) if len(vol_resid) > 1 else 0.0
 
-        common_idx = resid.index.intersection(vol_resid.index)
-        rho = float(np.corrcoef(resid.loc[common_idx], vol_resid.loc[common_idx])[0, 1]) if len(common_idx) > 2 else 0.0
+        common_idx = resid_full.index.intersection(vol_resid.index)
+        rho = float(np.corrcoef(resid_full.loc[common_idx], vol_resid.loc[common_idx])[0, 1]) if len(common_idx) > 2 else 0.0
         rho = float(np.clip(rho, -0.999, 0.999))
 
-        jump_idx = z.index[z > z_cut]
-        jump_events = resid.loc[jump_idx].clip(lower=0.0)
+        # ---- Two-sided jump calibration ----
+        pos_jump_idx = z.index[z > z_cut]
+        neg_jump_idx = z.index[z < -z_cut]
+        pos_jump_events = resid_full.loc[pos_jump_idx].clip(lower=0.0)
+        neg_jump_events = resid_full.loc[neg_jump_idx].clip(upper=0.0).abs()
+
         total_years = float((sample.index.max() - sample.index.min()).total_seconds() / 86400.0 / self.day_count_basis)
         if total_years <= 0:
             total_years = float(len(sample) * med_dt)
 
-        if len(jump_events) > 0:
-            jump_lambda = float(len(jump_events) / total_years)
-            jump_mu = float(max(jump_events.mean(), 0.0))
-            jump_sigma = float(jump_events.std(ddof=1)) if len(jump_events) > 1 else 0.0
+        if len(pos_jump_events) > 0:
+            jump_lambda = float(len(pos_jump_events) / total_years)
+            jump_mu = float(max(pos_jump_events.mean(), 0.0))
+            jump_sigma = float(pos_jump_events.std(ddof=1)) if len(pos_jump_events) > 1 else 0.0
             if not np.isfinite(jump_sigma) or jump_sigma <= 0:
-                jump_sigma = float(self._robust_mad(jump_events))
-            jump_cap = float(jump_events.quantile(0.995))
-            self.jump_samples_[regime] = jump_events.to_numpy(dtype=float)
+                jump_sigma = float(self._robust_mad(pos_jump_events))
+            jump_cap = float(pos_jump_events.quantile(0.995))
+            self.jump_samples_[regime + "_pos"] = pos_jump_events.to_numpy(dtype=float)
+            self.jump_samples_[regime] = pos_jump_events.to_numpy(dtype=float)  # backward-compat
         else:
             jump_lambda = 0.0
             jump_mu = 0.0
             jump_sigma = 0.0
             jump_cap = 0.0
+            self.jump_samples_[regime + "_pos"] = np.array([], dtype=float)
             self.jump_samples_[regime] = np.array([], dtype=float)
 
-        jump_count = int(len(jump_events))
+        if len(neg_jump_events) > 0:
+            neg_jump_lambda = float(len(neg_jump_events) / total_years)
+            neg_jump_mu = float(max(neg_jump_events.mean(), 0.0))
+            neg_jump_sigma = float(neg_jump_events.std(ddof=1)) if len(neg_jump_events) > 1 else 0.0
+            if not np.isfinite(neg_jump_sigma) or neg_jump_sigma <= 0:
+                neg_jump_sigma = float(self._robust_mad(neg_jump_events))
+            neg_jump_cap = float(neg_jump_events.quantile(0.995))
+            self.jump_samples_[regime + "_neg"] = neg_jump_events.to_numpy(dtype=float)
+        else:
+            neg_jump_lambda = 0.0
+            neg_jump_mu = 0.0
+            neg_jump_sigma = 0.0
+            neg_jump_cap = 0.0
+            self.jump_samples_[regime + "_neg"] = np.array([], dtype=float)
+
+        jump_count = int(len(pos_jump_events) + len(neg_jump_events))
 
         spot_bump_scale = float(sample.diff().abs().median())
         if not np.isfinite(spot_bump_scale) or spot_bump_scale <= 0:
@@ -680,7 +806,7 @@ class ElectricitySpotAsianPricer:
         result = CalibrationResult(
             regime=regime,
             theta_mean=float(self.seasonality_["overall"]),
-            kappa=float(ar["kappa"]),
+            kappa=kappa_final,
             sigma0=float(sigma0),
             sigma_bar=float(sigma_bar),
             a=float(a),
@@ -689,6 +815,10 @@ class ElectricitySpotAsianPricer:
             jump_lambda=float(jump_lambda),
             jump_mu=float(jump_mu),
             jump_sigma=float(jump_sigma),
+            neg_jump_lambda=float(neg_jump_lambda),
+            neg_jump_mu=float(neg_jump_mu),
+            neg_jump_sigma=float(neg_jump_sigma),
+            neg_jump_cap=float(neg_jump_cap),
             jump_threshold_z=float(z_cut),
             jump_count=int(jump_count),
             obs_frequency_years=float(med_dt),
@@ -697,9 +827,9 @@ class ElectricitySpotAsianPricer:
             spot_bump_scale=float(spot_bump_scale),
             sigma_bump_scale=float(sigma_bump_scale),
             jump_cap=float(jump_cap),
+            sigma_floor=float(max(float(sigma_clean.min()), np.finfo(float).tiny)),
+            sigma_ceiling=float(max(float(sigma_clean.max()), float(max(float(sigma_clean.min()), np.finfo(float).tiny)))),
         )
-        result.sigma_floor = float(max(float(sigma_clean.min()), np.finfo(float).tiny))
-        result.sigma_ceiling = float(max(float(sigma_clean.max()), result.sigma_floor))
         self.calibration_[regime] = result
         self._log(
             f"[CAL] finished | kappa={result.kappa:.4f} | sigma0={result.sigma0:.4f} | z_cut={z_cut:.3f} | jump_count={result.jump_count}",
@@ -793,7 +923,7 @@ class ElectricitySpotAsianPricer:
         sigmas = np.zeros_like(paths)
         paths[:, 0] = S0
         sigmas[:, 0] = p["sigma0"] if sigma0_override is None else float(sigma0_override)
-        jump_prob = 1.0 - np.exp(-max(p["jump_lambda"], 0.0) * dt)
+        jump_prob = 1.0 - np.exp(-max(p["jump_lambda"] + p.get("neg_jump_lambda", 0.0), 0.0) * dt)
         kappa = float(max(p["kappa"], 0.0))
         exp_kdt = np.exp(-kappa * dt) if kappa > 0 else 1.0
         ou_scale = np.sqrt((1.0 - np.exp(-2.0 * kappa * dt)) / (2.0 * kappa)) if kappa > 0 else np.sqrt(dt)
@@ -851,20 +981,30 @@ class ElectricitySpotAsianPricer:
         if int(in_window.sum()) < 1:
             raise ValueError("Delivery window is empty on the simulation grid.")
         window_sum = np.zeros_like(S)
-        jump_prob = 1.0 - np.exp(-max(p["jump_lambda"], 0.0) * dt)
+        jump_prob = 1.0 - np.exp(-max(p["jump_lambda"] + p.get("neg_jump_lambda", 0.0), 0.0) * dt)
+        kappa = float(max(p["kappa"], 0.0))
+        exp_kdt = np.exp(-kappa * dt) if kappa > 0 else 1.0
+        ou_scale = np.sqrt((1.0 - np.exp(-2.0 * kappa * dt)) / (2.0 * kappa)) if kappa > 0 else np.sqrt(dt)
+        sigma_floor = float(p.get("sigma_floor", np.finfo(float).tiny))
+        sigma_ceiling = float(p.get("sigma_ceiling", np.finfo(float).max))
+        log_floor = np.log(max(sigma_floor, np.finfo(float).tiny))
+        log_ceiling = np.log(max(sigma_ceiling, sigma_floor * (1.0 + np.finfo(float).eps)))
 
         for i in range(n_steps):
-            sigma_prev = np.maximum(sigma, np.finfo(float).tiny)
+            sigma_prev = np.clip(sigma, sigma_floor, sigma_ceiling)
             log_sigma_next = (
                 np.log(sigma_prev)
                 + p["a"] * (np.log(np.maximum(p["sigma_bar"], np.finfo(float).tiny)) - np.log(sigma_prev)) * dt
                 + p["eta"] * np.sqrt(dt) * zsigma[:, i]
             )
-            log_sigma_next = np.clip(log_sigma_next, np.log(np.finfo(float).tiny), np.log(np.finfo(float).max) - 1.0)
-            sigma = np.exp(log_sigma_next)
+            log_sigma_next = np.clip(log_sigma_next, log_floor, log_ceiling)
+            sigma = np.clip(np.exp(log_sigma_next), sigma_floor, sigma_ceiling)
             u_jump = norm.cdf(zj[:, i])
             jump = (uj[:, i] < jump_prob).astype(float) * self._draw_jump(p, u_jump)
-            S = S + p["kappa"] * (theta_grid[i] - S) * dt + sigma_prev * np.sqrt(dt) * z1[:, i] + jump
+            if kappa > 0:
+                S = theta_grid[i] + (S - theta_grid[i]) * exp_kdt + sigma_prev * ou_scale * z1[:, i] + jump
+            else:
+                S = S + p["kappa"] * (theta_grid[i] - S) * dt + sigma_prev * ou_scale * z1[:, i] + jump
             if in_window[i]:
                 window_sum += S
 
@@ -1021,7 +1161,7 @@ class ElectricitySpotAsianPricer:
             if antithetic:
                 z1 = np.vstack([z1, -z1])
                 z2 = np.vstack([z2, -z2])
-                uj = np.vstack([uj, uj])
+                uj = np.vstack([uj, 1.0 - uj])
                 zj = np.vstack([zj, -zj])
             return z1, z2, uj, zj
 
@@ -1041,7 +1181,7 @@ class ElectricitySpotAsianPricer:
                 raise ValueError("Delivery window is empty on the simulation grid.")
 
             window_sum = np.zeros_like(S)
-            jump_prob = 1.0 - np.exp(-max(p["jump_lambda"], 0.0) * dt)
+            jump_prob = 1.0 - np.exp(-max(p["jump_lambda"] + p.get("neg_jump_lambda", 0.0), 0.0) * dt)
             kappa = float(max(p["kappa"], 0.0))
             exp_kdt = np.exp(-kappa * dt) if kappa > 0 else 1.0
             ou_scale = np.sqrt((1.0 - np.exp(-2.0 * kappa * dt)) / (2.0 * kappa)) if kappa > 0 else np.sqrt(dt)
@@ -1342,21 +1482,56 @@ class ElectricitySpotAsianPricer:
         return combined.sort_index()
 
     def fit_forward_proxy(self, use_hourly: bool = True, verbose: int = 0) -> dict:
-        """Fit a simple data-driven spot->futures proxy on overlapping dates.
-        The proxy is linear in levels: Forward ≈ alpha + beta * Spot.
+        """Fit a data-driven spot->futures proxy on overlapping dates.
+
+        The Cal baseload future moves slowly relative to the daily spot; first-
+        differencing at daily frequency produces near-zero signal (the future
+        barely moves day-to-day while spot is noisy).  We therefore resample
+        both series to weekly means before differencing, which captures the
+        economically meaningful co-movement between the spot level and where
+        the Cal future settles over multi-day windows.
+
+        beta is estimated by intercept-free OLS on weekly first differences
+        (ΔF_weekly ≈ beta * ΔS_weekly).  The level intercept alpha is
+        recovered as mean(F - beta*S) over the overlap for use in delta
+        conversion during the hedge simulation.
         """
         overlap = self.align_spot_and_futures(use_hourly=use_hourly).copy()
-        x = overlap["Spot"].to_numpy(dtype=float)
-        y = overlap["Forward"].to_numpy(dtype=float)
-        X = np.column_stack([np.ones(len(x)), x])
-        coef, *_ = np.linalg.lstsq(X, y, rcond=None)
-        alpha = float(coef[0])
-        beta = float(coef[1])
 
-        y_hat = X @ coef
-        resid = y - y_hat
-        ss_res = float(np.sum(resid ** 2))
-        ss_tot = float(np.sum((y - y.mean()) ** 2))
+        # Resample to weekly means (Monday-anchored ISO weeks)
+        spot_weekly = overlap["Spot"].resample("W-MON").mean().dropna()
+        fwd_weekly = overlap["Forward"].resample("W-MON").mean().dropna()
+        weekly = pd.concat([spot_weekly.rename("Spot"), fwd_weekly.rename("Forward")], axis=1).dropna()
+
+        if len(weekly) < 10:
+            # Fall back to daily if not enough weekly observations
+            weekly = overlap.copy()
+            self._log("[FWD] warning: fewer than 10 weekly observations, falling back to daily", verbose)
+
+        spot_w = weekly["Spot"].to_numpy(dtype=float)
+        fwd_w = weekly["Forward"].to_numpy(dtype=float)
+
+        d_spot = np.diff(spot_w)
+        d_fwd = np.diff(fwd_w)
+        finite_mask = np.isfinite(d_spot) & np.isfinite(d_fwd)
+        d_spot_c = d_spot[finite_mask]
+        d_fwd_c = d_fwd[finite_mask]
+
+        if len(d_spot_c) < 5:
+            raise ValueError("Not enough overlapping first-difference observations for forward proxy.")
+
+        # Intercept-free OLS on weekly differences: beta = (ΔS'ΔF) / (ΔS'ΔS)
+        beta = float(np.dot(d_spot_c, d_fwd_c) / max(np.dot(d_spot_c, d_spot_c), np.finfo(float).tiny))
+
+        # Level intercept from daily overlap
+        spot_lvl = overlap["Spot"].to_numpy(dtype=float)
+        fwd_lvl = overlap["Forward"].to_numpy(dtype=float)
+        alpha = float(np.mean(fwd_lvl - beta * spot_lvl))
+
+        # R² on weekly first differences
+        d_fwd_hat = beta * d_spot_c
+        ss_res = float(np.sum((d_fwd_c - d_fwd_hat) ** 2))
+        ss_tot = float(np.sum((d_fwd_c - d_fwd_c.mean()) ** 2))
         r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
 
         proxy = {
@@ -1364,6 +1539,7 @@ class ElectricitySpotAsianPricer:
             "beta": beta,
             "r2": r2,
             "n_obs": int(len(overlap)),
+            "n_weekly": int(len(d_spot_c)),
             "start": overlap.index.min(),
             "end": overlap.index.max(),
             "spot_mean": float(overlap["Spot"].mean()),
@@ -1373,7 +1549,7 @@ class ElectricitySpotAsianPricer:
         }
         self.forward_proxy_ = proxy
         self._log(
-            f"[FWD] fitted proxy | alpha={alpha:.6f} | beta={beta:.6f} | r2={r2:.4f} | n={len(overlap)}",
+            f"[FWD] fitted proxy | alpha={alpha:.6f} | beta={beta:.6f} | r2={r2:.4f} | n={len(overlap)} | n_weekly={len(d_spot_c)}",
             verbose,
         )
         return proxy
