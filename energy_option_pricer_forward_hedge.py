@@ -311,12 +311,14 @@ class ElectricitySpotAsianPricer:
         S = float(S0)
         exp_path = np.zeros(n_steps + 1, dtype=float)
         exp_path[0] = S
+        # Under jump compensation the net expected jump drift is zero,
+        # so the expected path follows pure OU mean-reversion to theta.
         for i in range(n_steps):
             theta_i = float(theta_grid[i])
             if p["kappa"] > 0:
-                S = theta_i + (S - theta_i) * np.exp(-p["kappa"] * dt) + p["jump_lambda"] * dt * jump_mean
+                S = theta_i + (S - theta_i) * np.exp(-p["kappa"] * dt)
             else:
-                S = S + p["kappa"] * (theta_i - S) * dt + p["jump_lambda"] * dt * jump_mean
+                S = S + p["kappa"] * (theta_i - S) * dt
             exp_path[i + 1] = S
 
         tgrid = np.linspace(0.0, T, n_steps + 1)
@@ -731,9 +733,14 @@ class ElectricitySpotAsianPricer:
 
         sigma0 = float(sigma_clean.iloc[-1])
         sigma_bar = float(sigma_clean.median())
-        sigma_bump_scale = float(sigma_clean.diff().abs().dropna().median())
+        # Bump scale for vega FD Greeks: use 5% of sigma0, floored at 1% and
+        # capped at 20%.  The previous approach (median |Δσ_t| falling back to
+        # std) produced bumps larger than sigma0 itself when the rolling MAD
+        # series was nearly flat (as it is on hourly data), which made vega
+        # unreliable.  A relative bump gives a well-scaled one-sided shift.
+        sigma_bump_scale = float(np.clip(0.05 * sigma0, 0.01 * sigma0, 0.20 * sigma0))
         if not np.isfinite(sigma_bump_scale) or sigma_bump_scale <= 0:
-            sigma_bump_scale = float(sigma_clean.std(ddof=1))
+            sigma_bump_scale = max(float(sigma_clean.std(ddof=1)), 1e-8)
 
         log_sigma = np.log(np.maximum(sigma_clean, np.finfo(float).tiny))
         log_lag = log_sigma.shift(1).dropna()
@@ -923,7 +930,17 @@ class ElectricitySpotAsianPricer:
         sigmas = np.zeros_like(paths)
         paths[:, 0] = S0
         sigmas[:, 0] = p["sigma0"] if sigma0_override is None else float(sigma0_override)
-        jump_prob = 1.0 - np.exp(-max(p["jump_lambda"] + p.get("neg_jump_lambda", 0.0), 0.0) * dt)
+        lam_pos = float(p.get("jump_lambda", 0.0))
+        lam_neg = float(p.get("neg_jump_lambda", 0.0))
+        pos_samples = self.jump_samples_.get(regime + "_pos")
+        if pos_samples is None: pos_samples = self.jump_samples_.get(regime)
+        neg_samples = self.jump_samples_.get(regime + "_neg", None)
+        pos_mean = float(np.mean(pos_samples)) if (pos_samples is not None and len(pos_samples) > 0) else float(p.get("jump_mu", 0.0))
+        neg_mean = float(np.mean(neg_samples)) if (neg_samples is not None and len(neg_samples) > 0) else float(p.get("neg_jump_mu", 0.0))
+        # Jump compensation: subtract the expected jump contribution per dt so
+        # the jump process has zero net drift, consistent with risk-neutral pricing.
+        jump_compensation = (lam_pos * pos_mean - lam_neg * neg_mean) * dt
+        jump_prob = 1.0 - np.exp(-max(lam_pos + lam_neg, 0.0) * dt)
         kappa = float(max(p["kappa"], 0.0))
         exp_kdt = np.exp(-kappa * dt) if kappa > 0 else 1.0
         ou_scale = np.sqrt((1.0 - np.exp(-2.0 * kappa * dt)) / (2.0 * kappa)) if kappa > 0 else np.sqrt(dt)
@@ -942,7 +959,7 @@ class ElectricitySpotAsianPricer:
             log_sigma_next = np.clip(log_sigma_next, log_floor, log_ceiling)
             sigmas[:, i + 1] = np.clip(np.exp(log_sigma_next), sigma_floor, sigma_ceiling)
             u_jump = norm.cdf(zj[:, i])
-            jump = (uj[:, i] < jump_prob).astype(float) * self._draw_jump(p, u_jump)
+            jump = (uj[:, i] < jump_prob).astype(float) * self._draw_jump(p, u_jump) - jump_compensation
             if kappa > 0:
                 paths[:, i + 1] = theta_grid[i] + (paths[:, i] - theta_grid[i]) * exp_kdt + sigma_prev * ou_scale * z1[:, i] + jump
             else:
@@ -981,7 +998,15 @@ class ElectricitySpotAsianPricer:
         if int(in_window.sum()) < 1:
             raise ValueError("Delivery window is empty on the simulation grid.")
         window_sum = np.zeros_like(S)
-        jump_prob = 1.0 - np.exp(-max(p["jump_lambda"] + p.get("neg_jump_lambda", 0.0), 0.0) * dt)
+        lam_pos = float(p.get("jump_lambda", 0.0))
+        lam_neg = float(p.get("neg_jump_lambda", 0.0))
+        pos_samples = self.jump_samples_.get(regime + "_pos")
+        if pos_samples is None: pos_samples = self.jump_samples_.get(regime)
+        neg_samples = self.jump_samples_.get(regime + "_neg", None)
+        pos_mean = float(np.mean(pos_samples)) if (pos_samples is not None and len(pos_samples) > 0) else float(p.get("jump_mu", 0.0))
+        neg_mean = float(np.mean(neg_samples)) if (neg_samples is not None and len(neg_samples) > 0) else float(p.get("neg_jump_mu", 0.0))
+        jump_compensation = (lam_pos * pos_mean - lam_neg * neg_mean) * dt
+        jump_prob = 1.0 - np.exp(-max(lam_pos + lam_neg, 0.0) * dt)
         kappa = float(max(p["kappa"], 0.0))
         exp_kdt = np.exp(-kappa * dt) if kappa > 0 else 1.0
         ou_scale = np.sqrt((1.0 - np.exp(-2.0 * kappa * dt)) / (2.0 * kappa)) if kappa > 0 else np.sqrt(dt)
@@ -1000,7 +1025,7 @@ class ElectricitySpotAsianPricer:
             log_sigma_next = np.clip(log_sigma_next, log_floor, log_ceiling)
             sigma = np.clip(np.exp(log_sigma_next), sigma_floor, sigma_ceiling)
             u_jump = norm.cdf(zj[:, i])
-            jump = (uj[:, i] < jump_prob).astype(float) * self._draw_jump(p, u_jump)
+            jump = (uj[:, i] < jump_prob).astype(float) * self._draw_jump(p, u_jump) - jump_compensation
             if kappa > 0:
                 S = theta_grid[i] + (S - theta_grid[i]) * exp_kdt + sigma_prev * ou_scale * z1[:, i] + jump
             else:
@@ -1561,6 +1586,96 @@ class ElectricitySpotAsianPricer:
         beta = float(self.forward_proxy_["beta"])
         return float(alpha + beta * float(spot_price))
 
+    def synthetic_forward_price(
+        self,
+        S0: float,
+        sigma0: float,
+        delivery_start_t: float,
+        delivery_end_t: float,
+        regime: str = "all",
+        use_hourly: bool = True,
+        n_steps: int | None = None,
+    ) -> float:
+        """Model-implied forward price for delivery over [delivery_start_t, delivery_end_t].
+
+        Returns E_t[S̄_{[d0,d1]}] computed by propagating the expected OU path
+        from current state S0.  This is the fair-value forward price under the
+        calibrated model for any delivery window, allowing construction of
+        synthetic short-tenor forwards from the spot model when only a long-
+        tenor Cal future is available as a market instrument.
+
+        Because this is derived from the model's own drift, dF_synthetic/dS0
+        is analytically consistent with the option delta, giving a much tighter
+        hedge than the Cal proxy when the delivery windows differ.
+        """
+        T = delivery_end_t
+        if T <= 0:
+            return float(S0)
+        p = self.params(regime=regime, use_hourly=use_hourly)
+        n_steps_use = self._infer_n_steps(T, use_hourly=use_hourly, n_steps=n_steps)
+        dt = T / n_steps_use
+        step_days = T * self.day_count_basis / n_steps_use
+        ts = pd.date_range(
+            start=self.current_timestamp,
+            periods=n_steps_use + 1,
+            freq=pd.to_timedelta(step_days, unit="D"),
+        )
+        theta_grid = self.theta(ts)
+        kappa = float(max(p["kappa"], 0.0))
+
+        # Expected jump contribution per step (both signs)
+        pos_samples = self.jump_samples_.get(regime + "_pos", None)
+        neg_samples = self.jump_samples_.get(regime + "_neg", None)
+        pos_mean = float(np.mean(pos_samples)) if (pos_samples is not None and len(pos_samples) > 0) else float(p.get("jump_mu", 0.0))
+        neg_mean = float(np.mean(neg_samples)) if (neg_samples is not None and len(neg_samples) > 0) else float(p.get("neg_jump_mu", 0.0))
+        lam_pos = float(p.get("jump_lambda", 0.0))
+        lam_neg = float(p.get("neg_jump_lambda", 0.0))
+        jump_drift = (lam_pos * pos_mean - lam_neg * neg_mean) * dt
+
+        S = float(S0)
+        exp_path = np.zeros(n_steps_use + 1, dtype=float)
+        exp_path[0] = S
+        # Under jump compensation net expected jump drift is zero;
+        # expected path follows pure OU mean-reversion to theta.
+        for i in range(n_steps_use):
+            theta_i = float(theta_grid[i])
+            if kappa > 0:
+                S = theta_i + (S - theta_i) * np.exp(-kappa * dt)
+            else:
+                S = S + kappa * (theta_i - S) * dt
+            exp_path[i + 1] = S
+
+        tgrid = np.linspace(0.0, T, n_steps_use + 1)
+        mask = (tgrid[1:] >= float(delivery_start_t)) & (tgrid[1:] <= float(delivery_end_t))
+        if not np.any(mask):
+            return float(S0)
+        return float(exp_path[1:][mask].mean())
+
+    def synthetic_forward_delta(
+        self,
+        S0: float,
+        sigma0: float,
+        delivery_start_t: float,
+        delivery_end_t: float,
+        regime: str = "all",
+        use_hourly: bool = True,
+        n_steps: int | None = None,
+        dS: float | None = None,
+    ) -> float:
+        """Finite-difference dF_synthetic/dS0 for the model-implied forward.
+
+        Used to convert option spot-delta into synthetic-forward units during
+        dynamic hedging: hedge_units = delta_spot / dF_synthetic_dS.
+        """
+        if dS is None:
+            p = self.params(regime=regime, use_hourly=use_hourly)
+            dS = float(p.get("spot_bump_scale", max(abs(S0) * 0.01, 1e-4)))
+        S_up = S0 + dS
+        S_dn = max(S0 - dS, np.finfo(float).eps)
+        F_up = self.synthetic_forward_price(S_up, sigma0, delivery_start_t, delivery_end_t, regime, use_hourly, n_steps)
+        F_dn = self.synthetic_forward_price(S_dn, sigma0, delivery_start_t, delivery_end_t, regime, use_hourly, n_steps)
+        return float((F_up - F_dn) / (S_up - S_dn))
+
     # -------------------- hedge --------------------
     def _conditional_asian_price(
         self,
@@ -1632,13 +1747,35 @@ class ElectricitySpotAsianPricer:
         n_jobs: int = -1,
         verbose: int = 10,
         seed: int | None = None,
+        use_synthetic_forward: bool = True,
+        rebalance_freq_days: float | None = 7.0,
     ):
-        """Dynamic hedge against the calibrated futures proxy.
+        """Dynamic hedge using either the model-implied synthetic forward or the
+        historical Cal futures proxy.
 
-        This is a proxy hedge, not a perfect replication hedge. It uses:
-        1) a data-fitted linear spot->forward mapping on overlapping spot/futures dates,
-        2) the model delta of the Asian option with respect to spot,
-        3) conversion from spot delta to forward units via dF/dS ≈ beta.
+        use_synthetic_forward=True (default):
+            Constructs a model-implied forward for the *same delivery window*
+            as the Asian option at each rebalance step via
+            synthetic_forward_price().  The hedge ratio (forward units) is:
+
+                units = delta_spot / (dF_synthetic/dS)
+
+            Because the synthetic forward and the option share the same
+            delivery window and the same model, dF/dS ≈ 1 for delivery windows
+            that have not yet started, giving hedge units ≈ delta_spot.  This
+            eliminates the Cal-futures delivery-period mismatch (beta=0.24) and
+            provides a model-consistent hedge even when only a single long-tenor
+            market instrument is available.
+
+        use_synthetic_forward=False:
+            Falls back to the historical Cal futures proxy (alpha + beta*S).
+            Requires futures data to have been loaded.
+
+        rebalance_freq_days:
+            Target rebalancing interval in calendar days (default 7 = weekly).
+            Overridden if rebalance_grid is supplied explicitly.  More frequent
+            rebalancing adds inner-MC noise without proportional hedge improvement
+            when mean-reversion half-life >> rebalancing interval.
         """
         if S0 is None:
             S0 = self.current_price
@@ -1647,35 +1784,44 @@ class ElectricitySpotAsianPricer:
 
         p = self.params(regime=regime, use_hourly=use_hourly)
 
-        if self.futures_ is None:
-            raise ValueError("Load futures data first with load_futures_csv() before running the hedge.")
-        if self.forward_proxy_ is None:
-            proxy = self.fit_forward_proxy(use_hourly=use_hourly, verbose=verbose if verbose else 0)
+        # ---- Determine hedge instrument ----
+        if use_synthetic_forward:
+            # No market futures data required; use model-implied forward.
+            alpha = 0.0
+            beta = 1.0          # placeholder; we use dF_synthetic/dS directly
+            proxy_r2 = np.nan
+            proxy_n = 0
+            self._log("[HEDGE] instrument=synthetic_forward (model-implied, delivery-matched)", verbose)
         else:
-            proxy = self.forward_proxy_
-
-        beta = float(proxy["beta"])
-        alpha = float(proxy["alpha"])
-        if not np.isfinite(beta) or abs(beta) <= np.finfo(float).eps:
-            raise ValueError("Estimated forward proxy slope beta is too small to hedge with.")
+            if self.futures_ is None:
+                raise ValueError("Load futures data first with load_futures_csv() before running the hedge.")
+            if self.forward_proxy_ is None:
+                proxy = self.fit_forward_proxy(use_hourly=use_hourly, verbose=verbose if verbose else 0)
+            else:
+                proxy = self.forward_proxy_
+            beta = float(proxy["beta"])
+            alpha = float(proxy["alpha"])
+            proxy_r2 = float(proxy.get("r2", np.nan))
+            proxy_n = int(proxy.get("n_obs", 0))
+            if not np.isfinite(beta) or abs(beta) <= np.finfo(float).eps:
+                raise ValueError("Estimated forward proxy slope beta is too small to hedge with.")
+            self._log(f"[HEDGE] instrument=cal_futures_proxy | alpha={alpha:.6f} | beta={beta:.6f} | r2={proxy_r2:.4f}", verbose)
 
         if n_outer_paths is None:
             n_outer_paths = max(64, self._default_n_paths(use_hourly=use_hourly) // 4)
         if n_inner_paths is None:
             n_inner_paths = max(64, self._default_n_paths(use_hourly=use_hourly) // 4)
         if n_steps is None:
-            if self.futures_ is not None:
-                fut_dt = self._observed_dt_years(self.futures_.index)
-                if len(fut_dt) > 0 and np.isfinite(float(fut_dt.median())) and float(fut_dt.median()) > 0:
-                    n_steps = max(1, int(np.ceil(T / float(fut_dt.median()))))
-                else:
-                    n_steps = self._infer_n_steps(T, use_hourly=use_hourly, n_steps=None)
-            else:
-                n_steps = self._infer_n_steps(T, use_hourly=use_hourly, n_steps=None)
+            n_steps = self._infer_n_steps(T, use_hourly=use_hourly, n_steps=None)
 
+        # Build rebalance grid at the requested frequency (default weekly)
         if rebalance_grid is None:
-            # Data-driven default: rebalance on the simulation time grid implied by the observed sampling frequency.
-            rebalance_grid = np.linspace(0.0, T, n_steps + 1)
+            if rebalance_freq_days is not None and rebalance_freq_days > 0:
+                freq_years = float(rebalance_freq_days) / self.day_count_basis
+                n_rebals = max(2, int(np.ceil(T / freq_years)) + 1)
+                rebalance_grid = np.linspace(0.0, T, n_rebals)
+            else:
+                rebalance_grid = np.linspace(0.0, T, n_steps + 1)
         else:
             rebalance_grid = np.asarray(rebalance_grid, dtype=float)
             if rebalance_grid[0] != 0.0 or rebalance_grid[-1] != T:
@@ -1689,7 +1835,6 @@ class ElectricitySpotAsianPricer:
             f"[HEDGE] started | outer={n_outer_paths} | inner={n_inner_paths} | rebals={len(rebalance_grid)} | jobs={jobs}",
             verbose,
         )
-        self._log(f"[HEDGE] forward proxy | alpha={alpha:.6f} | beta={beta:.6f} | r2={proxy.get('r2', np.nan):.4f}", verbose)
 
         self._log("[HEDGE] Step 1/4: simulating outer paths", verbose)
         _, outer_paths, outer_sigmas, _ = self._simulate_paths_core(
@@ -1707,14 +1852,13 @@ class ElectricitySpotAsianPricer:
         reb_idx = np.searchsorted(outer_tgrid, rebalance_grid, side="left")
         reb_idx = np.clip(reb_idx, 0, len(outer_tgrid) - 1)
 
-        # Remove duplicate rebalance indices to avoid zero-length intervals.
         uniq, first_pos = np.unique(reb_idx, return_index=True)
         reb_idx = uniq
         rebalance_grid = rebalance_grid[np.sort(first_pos)]
 
         dS = float(p["spot_bump_scale"])
         if not np.isfinite(dS) or dS <= 0:
-            dS = max(abs(S0) * 1e-4, np.finfo(float).eps)
+            dS = max(abs(S0) * 0.01, np.finfo(float).eps)
 
         df_T = self.discount_factor(T)
         r = 0.0 if (T <= 0 or df_T <= 0) else float(-np.log(df_T) / T)
@@ -1725,6 +1869,7 @@ class ElectricitySpotAsianPricer:
             cash = 0.0
             units_prev = 0.0
             t_prev = 0.0
+            F_prev = 0.0
 
             for j, t in enumerate(rebalance_grid):
                 idx = int(reb_idx[j])
@@ -1734,91 +1879,91 @@ class ElectricitySpotAsianPricer:
                 rem_steps = max(1, self._infer_n_steps(rem_T, use_hourly=use_hourly, n_steps=None)) if rem_T > 0 else 1
                 seed_j = int(SeedSequence([path_seed, pidx, j]).generate_state(1)[0])
 
-                obs_times = outer_tgrid[1 : idx + 1]
-                obs_vals = outer_paths[pidx, 1 : idx + 1]
+                obs_times = outer_tgrid[1: idx + 1]
+                obs_vals = outer_paths[pidx, 1: idx + 1]
                 past_mask = (obs_times >= delivery_start) & (obs_times <= min(t, delivery_end))
                 past_sum = float(obs_vals[past_mask].sum())
                 past_count = int(past_mask.sum())
 
-                future_start, future_end = self._future_delivery_window(t, T, delivery_start, delivery_end)
+                future_start_abs = delivery_start
+                future_end_abs = delivery_end
 
+                # ---- Option price at S_t (base, up, dn) ----
                 price0 = self._conditional_asian_price(
-                    S_t,
-                    sig_t,
-                    past_sum,
-                    past_count,
-                    K,
-                    rem_T,
-                    future_start,
-                    future_end,
-                    regime,
-                    use_hourly,
-                    n_inner_paths,
-                    rem_steps,
-                    antithetic,
-                    seed_j,
-                    current_time=t,
+                    S_t, sig_t, past_sum, past_count, K, rem_T,
+                    future_start_abs, future_end_abs, regime, use_hourly,
+                    n_inner_paths, rem_steps, antithetic, seed_j, current_time=t,
                 )
                 price_up = self._conditional_asian_price(
-                    S_t + dS,
-                    sig_t,
-                    past_sum,
-                    past_count,
-                    K,
-                    rem_T,
-                    future_start,
-                    future_end,
-                    regime,
-                    use_hourly,
-                    n_inner_paths,
-                    rem_steps,
-                    antithetic,
-                    seed_j,
-                    current_time=t,
+                    S_t + dS, sig_t, past_sum, past_count, K, rem_T,
+                    future_start_abs, future_end_abs, regime, use_hourly,
+                    n_inner_paths, rem_steps, antithetic, seed_j, current_time=t,
                 )
                 price_dn = self._conditional_asian_price(
-                    max(S_t - dS, np.finfo(float).eps),
-                    sig_t,
-                    past_sum,
-                    past_count,
-                    K,
-                    rem_T,
-                    future_start,
-                    future_end,
-                    regime,
-                    use_hourly,
-                    n_inner_paths,
-                    rem_steps,
-                    antithetic,
-                    seed_j,
-                    current_time=t,
+                    max(S_t - dS, np.finfo(float).eps), sig_t, past_sum, past_count, K, rem_T,
+                    future_start_abs, future_end_abs, regime, use_hourly,
+                    n_inner_paths, rem_steps, antithetic, seed_j, current_time=t,
                 )
                 delta_spot = (price_up - price_dn) / (2.0 * dS)
 
-                # Convert spot delta into futures units using dF/dS ≈ beta from the overlapping historical sample.
-                units_new = delta_spot / beta
+                # ---- Hedge instrument price and sensitivity ----
+                if use_synthetic_forward:
+                    # Synthetic forward for the option's own delivery window
+                    # Shift time references: delivery window relative to current t
+                    del_start_rel = max(delivery_start - t, 0.0)
+                    del_end_rel = max(delivery_end - t, 0.0)
+                    if del_end_rel <= 0.0:
+                        # Past delivery: no future exposure, flat hedge
+                        F_t = float(S_t)
+                        dF_dS = 1.0
+                    else:
+                        F_t = self.synthetic_forward_price(
+                            S_t, sig_t, del_start_rel, del_end_rel, regime, use_hourly, rem_steps,
+                        )
+                        dF_dS = self.synthetic_forward_delta(
+                            S_t, sig_t, del_start_rel, del_end_rel, regime, use_hourly, rem_steps, dS=dS,
+                        )
+                    if not np.isfinite(dF_dS) or abs(dF_dS) < 1e-8:
+                        dF_dS = 1.0
+                    units_new = delta_spot / dF_dS
+                else:
+                    F_t = max(alpha + beta * S_t, np.finfo(float).eps)
+                    units_new = delta_spot / beta
 
-                F_t = max(alpha + beta * S_t, np.finfo(float).eps)
+                # ---- Update cash account ----
                 if j == 0:
                     cash = price0 - units_new * F_t
                 else:
                     cash *= np.exp(r * (t - t_prev))
+                    # Rebalancing cost: change in hedge units at current F price
                     cash -= (units_new - units_prev) * F_t
 
                 units_prev = units_new
+                F_prev = F_t
                 t_prev = t
 
+            # ---- Terminal settlement ----
             obs_times = outer_tgrid[1:]
             obs_vals = outer_paths[pidx, 1:]
             mask = (obs_times >= delivery_start) & (obs_times <= delivery_end)
             payoff = max(float(obs_vals[mask].mean()) - K, 0.0) if mask.any() else 0.0
-            F_T = max(alpha + beta * float(S_path[-1]), np.finfo(float).eps)
+
+            if use_synthetic_forward:
+                # Synthetic forward at expiry = realised average over delivery window
+                # (at T the forward *is* the spot for same-period delivery)
+                F_T = float(obs_vals[mask].mean()) if mask.any() else float(S_path[-1])
+            else:
+                F_T = max(alpha + beta * float(S_path[-1]), np.finfo(float).eps)
+
             return cash + units_prev * F_T - payoff
 
         seeds = SeedSequence(base_seed).spawn(n_outer_paths)
         self._log("[HEDGE] Step 3/4: dynamic rebalancing", verbose)
         if jobs <= 1:
-            pnl = np.asarray([hedge_one_path(i, int(seeds[i].generate_state(1)[0])) for i in range(n_outer_paths)], dtype=float)
+            pnl = np.asarray(
+                [hedge_one_path(i, int(seeds[i].generate_state(1)[0])) for i in range(n_outer_paths)],
+                dtype=float,
+            )
         else:
             with parallel_backend("threading"):
                 pnl = np.asarray(
@@ -1858,12 +2003,12 @@ class ElectricitySpotAsianPricer:
             "option_price": float(option_price),
             "forward_alpha": alpha,
             "forward_beta": beta,
-            "forward_r2": float(proxy.get("r2", np.nan)),
-            "forward_overlap_n": int(proxy.get("n_obs", 0)),
+            "forward_r2": proxy_r2,
+            "forward_overlap_n": proxy_n,
             "outer_paths": outer_paths,
             "outer_sigmas": outer_sigmas,
             "rebalance_grid": rebalance_grid,
-            "hedge_type": "forward_proxy",
+            "hedge_type": "synthetic_forward" if use_synthetic_forward else "forward_proxy",
         }
         self._log(f"[HEDGE] finished | mean_pnl={result['mean_pnl']:.6f} | var99={result['var_99']:.6f}", verbose)
         return result

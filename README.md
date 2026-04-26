@@ -19,8 +19,9 @@ Model parameters are calibrated from **historical German hourly electricity pric
 This project is a **research-grade demo**. 
 It is actively evolving:
 
+- Hedge: now using synthetic forwards derived from spot price data, but still negative PnL; needs further work
+- ECB curve discounting: old way to access data no longer works with new Python version, needs complete rewrite
 - Calibration logic still work in progress
-- Hedge: **critical, needs fixing**, 1 tenor of futures mismatched with the option, very coarse; synthesizing shorter tenors from spot data; improving logic overall
 - Overall computational efficiency is still being improved
 - Result summaries are still messy and are being improved
 
@@ -49,13 +50,6 @@ The model is built around a **seasonal mean-reverting electricity spot process**
 
 For the model formulas please see the demo notebook.
 
-The option payoff is modeled as:
-
-\[
-\max\left(\frac{1}{N}\sum_{i=1}^{N} S_{t_i} - K, 0\right)
-\]
-
-as for an **Asian-style contract on average spot**, specifically for delivery-window products in power markets.
 
 ---
 
@@ -94,8 +88,7 @@ The class provides:
 - Diagnostic reporting for bump sizes and model stability
 
 ### Hedging
-- **Forward-proxy hedge** based on futures data
-- Spot-to-futures regression proxy on overlapping dates
+- **Forward-proxy hedge** based on synthetic forwards of matching tenors
 - Minimum-variance style hedge logic
 - Hedged P&L simulation
 - Risk metrics: mean P&L, standard deviation, VaR, CVaR
@@ -113,11 +106,13 @@ The class provides:
 ## Data 
 
 - Spot data: hourly German electricity spot prices, taken from EMBER, from 2015 until Feb. 2026
-- Futures data: historical German yearly baseload at daily frequency, from 2017 to 2025; taken from investing.com; used for rough hedge proxy; **need more (and shorter) tenors** for basket construction for proper hedging
+- Futures data: historical German yearly baseload at daily frequency, from 2017 to 2025; taken from investing.com; currently **not used** because not suitable for hedging
 
 ---
 
 ## Notes on Hedging
+
+**Section outdated, is in rewrite**
 
 Currently the function:
 
@@ -133,16 +128,16 @@ A single yearly baseload future is not sufficient for hedging. This needs to be 
 
 ## Limitations
 
-### 1) Hedge quality depends on proxy quality
-If only a yearly futures series is available, the hedge is way too coarse and basis risk can remain large.
+- **Hedge quality depends on proxy quality**
+Need forwards of matching tenor to the maturity of the option, and hedge with the weighted combination of those. Might be still not enough, need to check for other limitations.
 
-### 2) No full forward curve
-The current setup works with available historical futures data, but it is not yet a full multi-tenor forward curve hedge.
+- **No historical forward curve available**
+Using synthesized forwards. 
 
-### 3) No market-implied volatility surface
-The framework is calibrated from historical data rather than option market quotes.
+- **No market-implied volatility surface**
+The calibration is done on historical spot price data, not from option market quotes.
 
-### 4) Monte Carlo runtime
+- **MC runtime**
 - Large path counts can be memory intensive
 - Nested pricing in hedge routines is expensive
 - Parallelization helps, but one layer of parallelism is sometimes needed and is not the best
