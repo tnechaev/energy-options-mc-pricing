@@ -1749,33 +1749,39 @@ class ElectricitySpotAsianPricer:
         seed: int | None = None,
         use_synthetic_forward: bool = True,
         rebalance_freq_days: float | None = 7.0,
+        n_inner_steps: int = 90,
+        strip_tenor_months: int | None = 1,
     ):
-        """Dynamic hedge using either the model-implied synthetic forward or the
-        historical Cal futures proxy.
+        """Dynamic multi-strip forward hedge for the Asian option.
 
-        use_synthetic_forward=True (default):
-            Constructs a model-implied forward for the *same delivery window*
-            as the Asian option at each rebalance step via
-            synthetic_forward_price().  The hedge ratio (forward units) is:
+        Hedging logic (use_synthetic_forward=True, default):
+        -------------------------------------------------------
+        At each rebalancing step t, the remaining delivery window
+        [max(delivery_start, t), delivery_end] is split into monthly
+        sub-strips (controlled by strip_tenor_months).  For each sub-strip i:
 
-                units = delta_spot / (dF_synthetic/dS)
+          F_i(t) = E_t[ S̄_{sub_i} ]   (model-implied synthetic forward)
+          dF_i/dS ≈ exp(-κ * mid_i)    (analytic OU sensitivity)
 
-            Because the synthetic forward and the option share the same
-            delivery window and the same model, dF/dS ≈ 1 for delivery windows
-            that have not yet started, giving hedge units ≈ delta_spot.  This
-            eliminates the Cal-futures delivery-period mismatch (beta=0.24) and
-            provides a model-consistent hedge even when only a single long-tenor
-            market instrument is available.
+        The option's payoff is a weighted average of these strips, so the
+        total hedge ratio in strip-i units is:
 
-        use_synthetic_forward=False:
-            Falls back to the historical Cal futures proxy (alpha + beta*S).
-            Requires futures data to have been loaded.
+          h_i = (w_i / dF_i_dS) * delta_spot
 
-        rebalance_freq_days:
-            Target rebalancing interval in calendar days (default 7 = weekly).
-            Overridden if rebalance_grid is supplied explicitly.  More frequent
-            rebalancing adds inner-MC noise without proportional hedge improvement
-            when mean-reversion half-life >> rebalancing interval.
+        where w_i = |sub_i| / |delivery window| is the relative weight.
+
+        Each strip is hedged separately, giving a multi-tenor forward curve.
+        Short-dated strips (small mid_i) have dF/dS closer to 1 and provide
+        much tighter hedges under fast mean-reversion (kappa=20 → half-life
+        12 days makes only near-dated strips effective).
+
+        strip_tenor_months=1 → monthly strips (recommended for kappa>10)
+        strip_tenor_months=None → single delivery-matched tenor (original)
+
+        use_synthetic_forward=False: falls back to the historical Cal proxy.
+
+        n_inner_steps: steps used in inner MC pricing (default 90 ≈ daily
+        for T=0.25-0.5y, much cheaper than full hourly resolution).
         """
         if S0 is None:
             S0 = self.current_price
@@ -1783,15 +1789,15 @@ class ElectricitySpotAsianPricer:
             delivery_end = T
 
         p = self.params(regime=regime, use_hourly=use_hourly)
+        kappa = float(max(p["kappa"], 0.0))
 
         # ---- Determine hedge instrument ----
         if use_synthetic_forward:
-            # No market futures data required; use model-implied forward.
             alpha = 0.0
-            beta = 1.0          # placeholder; we use dF_synthetic/dS directly
+            beta = 1.0
             proxy_r2 = np.nan
             proxy_n = 0
-            self._log("[HEDGE] instrument=synthetic_forward (model-implied, delivery-matched)", verbose)
+            self._log("[HEDGE] instrument=synthetic_forward (multi-strip, model-implied)", verbose)
         else:
             if self.futures_ is None:
                 raise ValueError("Load futures data first with load_futures_csv() before running the hedge.")
@@ -1812,16 +1818,12 @@ class ElectricitySpotAsianPricer:
         if n_inner_paths is None:
             n_inner_paths = max(64, self._default_n_paths(use_hourly=use_hourly) // 4)
         if n_steps is None:
-            n_steps = self._infer_n_steps(T, use_hourly=use_hourly, n_steps=None)
+            n_steps = self._infer_n_steps(T, use_hourly=False, n_steps=None)  # daily outer paths
 
-        # Build rebalance grid at the requested frequency (default weekly)
         if rebalance_grid is None:
-            if rebalance_freq_days is not None and rebalance_freq_days > 0:
-                freq_years = float(rebalance_freq_days) / self.day_count_basis
-                n_rebals = max(2, int(np.ceil(T / freq_years)) + 1)
-                rebalance_grid = np.linspace(0.0, T, n_rebals)
-            else:
-                rebalance_grid = np.linspace(0.0, T, n_steps + 1)
+            freq_years = float(rebalance_freq_days or 7.0) / self.day_count_basis
+            n_rebals = max(2, int(np.ceil(T / freq_years)) + 1)
+            rebalance_grid = np.linspace(0.0, T, n_rebals)
         else:
             rebalance_grid = np.asarray(rebalance_grid, dtype=float)
             if rebalance_grid[0] != 0.0 or rebalance_grid[-1] != T:
@@ -1831,27 +1833,31 @@ class ElectricitySpotAsianPricer:
         base_seed = self.seed if seed is None else int(seed)
         jobs = self._resolve_n_jobs(n_jobs)
 
+        # ---- Build strip schedule (fixed at inception) ----
+        month_yr = 1.0 / 12.0
+        if use_synthetic_forward and strip_tenor_months is not None:
+            strip_w = float(strip_tenor_months) * month_yr
+            n_strips_total = max(1, int(np.ceil((delivery_end - delivery_start) / strip_w)))
+            strip_edges = np.linspace(delivery_start, delivery_end, n_strips_total + 1)
+        else:
+            strip_edges = np.array([delivery_start, delivery_end])
+            n_strips_total = 1
+
         self._log(
-            f"[HEDGE] started | outer={n_outer_paths} | inner={n_inner_paths} | rebals={len(rebalance_grid)} | jobs={jobs}",
+            f"[HEDGE] started | outer={n_outer_paths} | inner={n_inner_paths} | "
+            f"rebals={len(rebalance_grid)} | strips={n_strips_total} | inner_steps={n_inner_steps} | jobs={jobs}",
             verbose,
         )
 
         self._log("[HEDGE] Step 1/4: simulating outer paths", verbose)
         _, outer_paths, outer_sigmas, _ = self._simulate_paths_core(
-            T=T,
-            regime=regime,
-            use_hourly=use_hourly,
-            n_paths=n_outer_paths,
-            n_steps=n_steps,
-            antithetic=antithetic,
-            S0=S0,
-            sigma0_override=sigma0_override,
-            seed=base_seed,
+            T=T, regime=regime, use_hourly=use_hourly, n_paths=n_outer_paths,
+            n_steps=n_steps, antithetic=antithetic, S0=S0,
+            sigma0_override=sigma0_override, seed=base_seed,
         )
         outer_tgrid = np.linspace(0.0, T, outer_paths.shape[1])
         reb_idx = np.searchsorted(outer_tgrid, rebalance_grid, side="left")
         reb_idx = np.clip(reb_idx, 0, len(outer_tgrid) - 1)
-
         uniq, first_pos = np.unique(reb_idx, return_index=True)
         reb_idx = uniq
         rebalance_grid = rebalance_grid[np.sort(first_pos)]
@@ -1862,100 +1868,127 @@ class ElectricitySpotAsianPricer:
 
         df_T = self.discount_factor(T)
         r = 0.0 if (T <= 0 or df_T <= 0) else float(-np.log(df_T) / T)
+        total_delivery_len = float(delivery_end - delivery_start)
 
         def hedge_one_path(pidx: int, path_seed: int):
             S_path = outer_paths[pidx]
             sig_path = outer_sigmas[pidx]
-            cash = 0.0
-            units_prev = 0.0
+            # cash[i] = cash account for strip i; units[i] = forward units held
+            n_s = len(strip_edges) - 1
+            cash_strips = np.zeros(n_s, dtype=float)
+            units_strips = np.zeros(n_s, dtype=float)
+            cash_main = 0.0
             t_prev = 0.0
-            F_prev = 0.0
 
             for j, t in enumerate(rebalance_grid):
                 idx = int(reb_idx[j])
                 S_t = float(S_path[idx])
                 sig_t = float(sig_path[idx]) if sigma0_override is None else float(sigma0_override)
                 rem_T = max(T - t, 0.0)
-                rem_steps = max(1, self._infer_n_steps(rem_T, use_hourly=use_hourly, n_steps=None)) if rem_T > 0 else 1
                 seed_j = int(SeedSequence([path_seed, pidx, j]).generate_state(1)[0])
 
+                # Accumulated past observations in delivery window
                 obs_times = outer_tgrid[1: idx + 1]
                 obs_vals = outer_paths[pidx, 1: idx + 1]
                 past_mask = (obs_times >= delivery_start) & (obs_times <= min(t, delivery_end))
                 past_sum = float(obs_vals[past_mask].sum())
                 past_count = int(past_mask.sum())
 
-                future_start_abs = delivery_start
-                future_end_abs = delivery_end
+                # Option price at S_t (base, up, dn) using fixed n_inner_steps
+                rem_steps = max(4, min(n_inner_steps, int(np.ceil(rem_T * self.day_count_basis))))
+                # Pass *absolute* delivery coords; _conditional_asian_price calls
+                # _future_delivery_window internally to shift to relative time.
+                def _price(spot):
+                    return self._conditional_asian_price(
+                        spot, sig_t, past_sum, past_count, K, rem_T,
+                        delivery_start, delivery_end, regime, use_hourly,
+                        n_inner_paths, rem_steps, antithetic, seed_j, current_time=t,
+                    )
 
-                # ---- Option price at S_t (base, up, dn) ----
-                price0 = self._conditional_asian_price(
-                    S_t, sig_t, past_sum, past_count, K, rem_T,
-                    future_start_abs, future_end_abs, regime, use_hourly,
-                    n_inner_paths, rem_steps, antithetic, seed_j, current_time=t,
-                )
-                price_up = self._conditional_asian_price(
-                    S_t + dS, sig_t, past_sum, past_count, K, rem_T,
-                    future_start_abs, future_end_abs, regime, use_hourly,
-                    n_inner_paths, rem_steps, antithetic, seed_j, current_time=t,
-                )
-                price_dn = self._conditional_asian_price(
-                    max(S_t - dS, np.finfo(float).eps), sig_t, past_sum, past_count, K, rem_T,
-                    future_start_abs, future_end_abs, regime, use_hourly,
-                    n_inner_paths, rem_steps, antithetic, seed_j, current_time=t,
-                )
-                delta_spot = (price_up - price_dn) / (2.0 * dS)
+                p0 = _price(S_t)
+                p_up = _price(S_t + dS)
+                p_dn = _price(max(S_t - dS, np.finfo(float).eps))
+                delta_spot = (p_up - p_dn) / (2.0 * dS)
 
-                # ---- Hedge instrument price and sensitivity ----
+                # ---- Multi-strip hedge ----
                 if use_synthetic_forward:
-                    # Synthetic forward for the option's own delivery window
-                    # Shift time references: delivery window relative to current t
-                    del_start_rel = max(delivery_start - t, 0.0)
-                    del_end_rel = max(delivery_end - t, 0.0)
-                    if del_end_rel <= 0.0:
-                        # Past delivery: no future exposure, flat hedge
-                        F_t = float(S_t)
-                        dF_dS = 1.0
-                    else:
-                        F_t = self.synthetic_forward_price(
-                            S_t, sig_t, del_start_rel, del_end_rel, regime, use_hourly, rem_steps,
+                    # Compute the near-dated strip sensitivity (most liquid strip
+                    # that is not yet fully elapsed) to cap leverage on far strips.
+                    # Far-dated strips with exp(-kappa*mid) << 1 are not genuinely
+                    # hedgeable; dividing by a tiny dF/dS explodes position size.
+                    active_sensitivities = []
+                    for si in range(n_s):
+                        if strip_edges[si + 1] > t:
+                            rel_s0_tmp = max(strip_edges[si] - t, 0.0)
+                            rel_s1_tmp = max(strip_edges[si + 1] - t, 0.0)
+                            mid_tmp = 0.5 * (rel_s0_tmp + rel_s1_tmp)
+                            active_sensitivities.append(float(np.exp(-kappa * mid_tmp)) if kappa > 0 else 1.0)
+                    # Max leverage = 1 / (sensitivity of the nearest active strip)
+                    max_dFdS_inv = 1.0 / max(max(active_sensitivities) if active_sensitivities else 1.0, 1e-4)
+
+                    for si in range(n_s):
+                        s0e = strip_edges[si]
+                        s1e = strip_edges[si + 1]
+                        # Skip strips already fully past
+                        if s1e <= t:
+                            continue
+                        rel_s0 = max(s0e - t, 0.0)
+                        rel_s1 = max(s1e - t, 0.0)
+                        if rel_s1 <= 0.0:
+                            continue
+                        strip_len = float(s1e - s0e)
+                        w_i = strip_len / total_delivery_len
+                        mid_i = 0.5 * (rel_s0 + rel_s1)
+                        # Analytic OU sensitivity: dF_i/dS = exp(-kappa * mid_i)
+                        dF_dS_i = float(np.exp(-kappa * mid_i)) if kappa > 0 else 1.0
+                        dF_dS_i = max(dF_dS_i, 1e-6)
+                        # Cap leverage at the near-dated strip's inverse sensitivity
+                        # to avoid explosion on far-dated unhedgeable strips
+                        lev_i = min(1.0 / dF_dS_i, max_dFdS_inv)
+                        # Strip forward price
+                        F_i = self.synthetic_forward_price(
+                            S_t, sig_t, rel_s0, rel_s1, regime, use_hourly, rem_steps,
                         )
-                        dF_dS = self.synthetic_forward_delta(
-                            S_t, sig_t, del_start_rel, del_end_rel, regime, use_hourly, rem_steps, dS=dS,
-                        )
-                    if not np.isfinite(dF_dS) or abs(dF_dS) < 1e-8:
-                        dF_dS = 1.0
-                    units_new = delta_spot / dF_dS
+                        # Hedge units for this strip (leverage-capped)
+                        h_i = w_i * lev_i * delta_spot
+                        if j == 0:
+                            cash_strips[si] = w_i * p0 - h_i * F_i
+                        else:
+                            cash_strips[si] *= np.exp(r * (t - t_prev))
+                            cash_strips[si] -= (h_i - units_strips[si]) * F_i
+                        units_strips[si] = h_i
                 else:
                     F_t = max(alpha + beta * S_t, np.finfo(float).eps)
-                    units_new = delta_spot / beta
+                    h = delta_spot / max(abs(beta), 1e-8)
+                    if j == 0:
+                        cash_main = p0 - h * F_t
+                    else:
+                        cash_main *= np.exp(r * (t - t_prev))
+                        cash_main -= (h - units_strips[0]) * F_t
+                    units_strips[0] = h
 
-                # ---- Update cash account ----
-                if j == 0:
-                    cash = price0 - units_new * F_t
-                else:
-                    cash *= np.exp(r * (t - t_prev))
-                    # Rebalancing cost: change in hedge units at current F price
-                    cash -= (units_new - units_prev) * F_t
-
-                units_prev = units_new
-                F_prev = F_t
                 t_prev = t
 
             # ---- Terminal settlement ----
             obs_times = outer_tgrid[1:]
             obs_vals = outer_paths[pidx, 1:]
             mask = (obs_times >= delivery_start) & (obs_times <= delivery_end)
-            payoff = max(float(obs_vals[mask].mean()) - K, 0.0) if mask.any() else 0.0
+            realised_avg = float(obs_vals[mask].mean()) if mask.any() else float(S_path[-1])
+            payoff = max(realised_avg - K, 0.0)
 
             if use_synthetic_forward:
-                # Synthetic forward at expiry = realised average over delivery window
-                # (at T the forward *is* the spot for same-period delivery)
-                F_T = float(obs_vals[mask].mean()) if mask.any() else float(S_path[-1])
+                # Close each strip at its realised average
+                terminal_pnl = float(np.sum(cash_strips))
+                for si in range(n_s):
+                    s0e = strip_edges[si]
+                    s1e = strip_edges[si + 1]
+                    strip_mask = (obs_times >= s0e) & (obs_times <= s1e)
+                    F_T_i = float(obs_vals[strip_mask].mean()) if strip_mask.any() else realised_avg
+                    terminal_pnl += units_strips[si] * F_T_i
+                return terminal_pnl - payoff
             else:
                 F_T = max(alpha + beta * float(S_path[-1]), np.finfo(float).eps)
-
-            return cash + units_prev * F_T - payoff
+                return cash_main + units_strips[0] * F_T - payoff
 
         seeds = SeedSequence(base_seed).spawn(n_outer_paths)
         self._log("[HEDGE] Step 3/4: dynamic rebalancing", verbose)
@@ -1974,23 +2007,34 @@ class ElectricitySpotAsianPricer:
                     dtype=float,
                 )
 
+        # ---- Diagnostics ----
+        if use_synthetic_forward:
+            syn_F0 = self.synthetic_forward_price(
+                float(S0), float(p["sigma0"]), float(delivery_start), float(delivery_end),
+                regime, use_hourly, n_steps,
+            )
+            half_life_days = float(np.log(2) / kappa * self.day_count_basis) if kappa > 0 else np.inf
+            # dF/dS for each strip at t=0 (diagnostic)
+            strip_sensitivities = []
+            for si in range(n_strips_total):
+                mid = 0.5 * (strip_edges[si] + strip_edges[si + 1])
+                strip_sensitivities.append(float(np.exp(-kappa * mid)) if kappa > 0 else 1.0)
+            proxy_r2 = float(np.mean(strip_sensitivities))  # average dF/dS across strips
+            self._log(
+                f"[HEDGE] strips={n_strips_total} | F0={syn_F0:.3f} | kappa={kappa:.3f} | "
+                f"half_life_days={half_life_days:.1f} | "
+                f"avg_dFdS={proxy_r2:.4f} | min_dFdS={min(strip_sensitivities):.4f} | "
+                f"max_dFdS={max(strip_sensitivities):.4f}",
+                verbose,
+            )
+
         self._log("[HEDGE] Step 4/4: summarizing hedge PnL", verbose)
         option_price = self.price_asian_call_cv_mc(
-            K=K,
-            T=T,
-            regime=regime,
-            use_hourly=use_hourly,
-            n_paths=max(256, n_inner_paths),
-            n_steps=n_steps,
-            antithetic=antithetic,
-            S0=S0,
-            sigma0_override=sigma0_override,
-            delivery_start=delivery_start,
-            delivery_end=delivery_end,
-            seed=base_seed,
-            n_jobs=1,
-            verbose=0,
-            sampling="mc",
+            K=K, T=T, regime=regime, use_hourly=use_hourly,
+            n_paths=max(256, n_inner_paths), n_steps=n_inner_steps,
+            antithetic=antithetic, S0=S0, sigma0_override=sigma0_override,
+            delivery_start=delivery_start, delivery_end=delivery_end,
+            seed=base_seed, n_jobs=1, verbose=0, sampling="mc",
             control_variate="average",
         )["price"]
 
@@ -2008,11 +2052,12 @@ class ElectricitySpotAsianPricer:
             "outer_paths": outer_paths,
             "outer_sigmas": outer_sigmas,
             "rebalance_grid": rebalance_grid,
-            "hedge_type": "synthetic_forward" if use_synthetic_forward else "forward_proxy",
+            "hedge_type": "synthetic_forward_multi_strip" if use_synthetic_forward else "forward_proxy",
+            "n_strips": n_strips_total,
+            "strip_edges": strip_edges,
         }
         self._log(f"[HEDGE] finished | mean_pnl={result['mean_pnl']:.6f} | var99={result['var_99']:.6f}", verbose)
         return result
-
     def simulate_dynamic_delta_hedge(
         self,
         K: float,
