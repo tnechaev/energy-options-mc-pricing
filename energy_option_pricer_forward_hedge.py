@@ -462,7 +462,6 @@ class ElectricitySpotAsianPricer:
         return out
 
     def load_forward_csv(self, *args, **kwargs) -> pd.DataFrame:
-        """Alias for load_futures_csv() for terminology consistency."""
         return self.load_futures_csv(*args, **kwargs)
 
     # -------------------- accessors --------------------
@@ -663,8 +662,8 @@ class ElectricitySpotAsianPricer:
         # ----------------------------------------------------------------
         # Kappa estimation: always use daily aggregated data.
         # AR(1) on hourly data measures intra-day autocorrelation, not the
-        # multi-day OU mean-reversion speed.  Aggregating to daily before
-        # fitting kappa gives an economically meaningful half-life.
+        # multi-day model mean-reversion speed.  Aggregating to daily before
+        # fitting kappa gives more meaningful half-life.
         # ----------------------------------------------------------------
         if use_hourly and self.hourly_ is not None:
             s_daily = self.aggregate_hourly_to_daily(self.hourly_)["Price"].astype(float).dropna()
@@ -703,7 +702,7 @@ class ElectricitySpotAsianPricer:
 
         # ----------------------------------------------------------------
         # Sigma / vol-of-vol / jump calibration: use full-frequency sample
-        # Re-compute residuals using daily kappa phi translated to hourly dt
+        # Recompute residuals using daily kappa phi translated to hourly dt
         # ----------------------------------------------------------------
         phi_hourly = float(np.exp(-kappa_final * med_dt))
         phi_hourly = float(np.clip(phi_hourly, 1e-10, 1.0 - 1e-10))
@@ -734,10 +733,7 @@ class ElectricitySpotAsianPricer:
         sigma0 = float(sigma_clean.iloc[-1])
         sigma_bar = float(sigma_clean.median())
         # Bump scale for vega FD Greeks: use 5% of sigma0, floored at 1% and
-        # capped at 20%.  The previous approach (median |Δσ_t| falling back to
-        # std) produced bumps larger than sigma0 itself when the rolling MAD
-        # series was nearly flat (as it is on hourly data), which made vega
-        # unreliable.  A relative bump gives a well-scaled one-sided shift.
+        # capped at 20%.  A relative bump gives a better-scaled one-sided shift.
         sigma_bump_scale = float(np.clip(0.05 * sigma0, 0.01 * sigma0, 0.20 * sigma0))
         if not np.isfinite(sigma_bump_scale) or sigma_bump_scale <= 0:
             sigma_bump_scale = max(float(sigma_clean.std(ddof=1)), 1e-8)
@@ -1324,6 +1320,84 @@ class ElectricitySpotAsianPricer:
         return pd.DataFrame(rows)
 
     # -------------------- Greeks / surface --------------------
+    def convergence_test(
+        self,
+        K: float,
+        T: float,
+        regime: str = "all",
+        use_hourly: bool = True,
+        n_steps: int = 90,
+        target_rel_stderr: float = 0.01,
+        pilot_paths: int = 256,
+        max_paths: int = 50000,
+        antithetic: bool = True,
+        seed: int | None = None,
+        delivery_start: float = 0.0,
+        delivery_end: float | None = None,
+        verbose: int = 10,
+    ) -> dict:
+        """Estimate required path count to achieve target relative stderr.
+
+        Uses a pilot run (pilot_paths) to estimate variance, then computes
+        the required N analytically.  Runs one final full pricing at that N
+        to confirm.  Total cost: 2 pricing calls.
+
+        target_rel_stderr: desired stderr / price (default 1%)
+        Returns dict with recommended n_paths, achieved price and stderr.
+        """
+        base_seed = self.seed if seed is None else int(seed)
+        if delivery_end is None:
+            delivery_end = T
+
+        self._log(f"[CONV] pilot run | n={pilot_paths} | target_rel_stderr={target_rel_stderr:.3f}", verbose)
+        pilot = self.price_asian_call_cv_mc(
+            K=K, T=T, regime=regime, use_hourly=use_hourly,
+            n_paths=pilot_paths, n_steps=n_steps, antithetic=antithetic,
+            delivery_start=delivery_start, delivery_end=delivery_end,
+            seed=base_seed, n_jobs=-1, verbose=0, sampling="mc",
+            control_variate="average",
+        )
+        pilot_price = float(pilot["price"])
+        pilot_stderr = float(pilot["stderr"])
+
+        if pilot_price <= 0 or not np.isfinite(pilot_stderr) or pilot_stderr <= 0:
+            self._log("[CONV] pilot price zero or stderr invalid; using pilot_paths as recommendation", verbose)
+            return {"recommended_n_paths": pilot_paths, "pilot_price": pilot_price,
+                    "pilot_stderr": pilot_stderr, "final_price": pilot_price,
+                    "final_stderr": pilot_stderr, "converged": False}
+
+        # Variance scales as 1/N: N_needed = N_pilot * (stderr_pilot / target_stderr)^2
+        target_stderr_abs = target_rel_stderr * abs(pilot_price)
+        n_needed = int(np.ceil(pilot_paths * (pilot_stderr / target_stderr_abs) ** 2))
+        n_needed = int(np.clip(n_needed, pilot_paths, max_paths))
+        self._log(
+            f"[CONV] pilot_price={pilot_price:.4f} | pilot_stderr={pilot_stderr:.4f} | "
+            f"target_stderr={target_stderr_abs:.4f} | recommended_n={n_needed}", verbose,
+        )
+
+        final = self.price_asian_call_cv_mc(
+            K=K, T=T, regime=regime, use_hourly=use_hourly,
+            n_paths=n_needed, n_steps=n_steps, antithetic=antithetic,
+            delivery_start=delivery_start, delivery_end=delivery_end,
+            seed=base_seed + 1, n_jobs=-1, verbose=0, sampling="mc",
+            control_variate="average",
+        )
+        achieved_rel = float(final["stderr"]) / abs(float(final["price"])) if float(final["price"]) != 0 else np.inf
+        converged = achieved_rel <= target_rel_stderr * 1.1
+        self._log(
+            f"[CONV] final_price={final['price']:.4f} | final_stderr={final['stderr']:.4f} | "
+            f"rel_stderr={achieved_rel:.4f} | converged={converged}", verbose,
+        )
+        return {
+            "recommended_n_paths": n_needed,
+            "pilot_price": pilot_price,
+            "pilot_stderr": pilot_stderr,
+            "final_price": float(final["price"]),
+            "final_stderr": float(final["stderr"]),
+            "achieved_rel_stderr": achieved_rel,
+            "converged": converged,
+        }
+
     def finite_difference_greeks(
         self,
         K: float,
@@ -1511,7 +1585,7 @@ class ElectricitySpotAsianPricer:
 
         The Cal baseload future moves slowly relative to the daily spot; first-
         differencing at daily frequency produces near-zero signal (the future
-        barely moves day-to-day while spot is noisy).  We therefore resample
+        barely moves day-to-day while spot is noisy). Therefore resample
         both series to weekly means before differencing, which captures the
         economically meaningful co-movement between the spot level and where
         the Cal future settles over multi-day windows.
@@ -1598,14 +1672,13 @@ class ElectricitySpotAsianPricer:
     ) -> float:
         """Model-implied forward price for delivery over [delivery_start_t, delivery_end_t].
 
-        Returns E_t[S̄_{[d0,d1]}] computed by propagating the expected OU path
+        Returns E_t[S̄_{[d0,d1]}] computed by propagating the expected main model path
         from current state S0.  This is the fair-value forward price under the
         calibrated model for any delivery window, allowing construction of
-        synthetic short-tenor forwards from the spot model when only a long-
-        tenor Cal future is available as a market instrument.
+        synthetic short-tenor forwards from the spot model.
 
         Because this is derived from the model's own drift, dF_synthetic/dS0
-        is analytically consistent with the option delta, giving a much tighter
+        is analytically consistent with the option delta, giving a better
         hedge than the Cal proxy when the delivery windows differ.
         """
         T = delivery_end_t
@@ -1761,7 +1834,7 @@ class ElectricitySpotAsianPricer:
         sub-strips (controlled by strip_tenor_months).  For each sub-strip i:
 
           F_i(t) = E_t[ S̄_{sub_i} ]   (model-implied synthetic forward)
-          dF_i/dS ≈ exp(-κ * mid_i)    (analytic OU sensitivity)
+          dF_i/dS ≈ exp(-κ * mid_i)    (analytic model sensitivity)
 
         The option's payoff is a weighted average of these strips, so the
         total hedge ratio in strip-i units is:
@@ -1772,16 +1845,16 @@ class ElectricitySpotAsianPricer:
 
         Each strip is hedged separately, giving a multi-tenor forward curve.
         Short-dated strips (small mid_i) have dF/dS closer to 1 and provide
-        much tighter hedges under fast mean-reversion (kappa=20 → half-life
-        12 days makes only near-dated strips effective).
+        tighter hedges under fast mean-reversion (kappa=20 -> half-life
+        12 days makes mostly near-dated strips effective).
 
-        strip_tenor_months=1 → monthly strips (recommended for kappa>10)
-        strip_tenor_months=None → single delivery-matched tenor (original)
+        strip_tenor_months=1 -> monthly strips (recommended for kappa>10)
+        strip_tenor_months=None -> single delivery-matched tenor (original)
 
         use_synthetic_forward=False: falls back to the historical Cal proxy.
 
-        n_inner_steps: steps used in inner MC pricing (default 90 ≈ daily
-        for T=0.25-0.5y, much cheaper than full hourly resolution).
+        n_inner_steps: steps used in inner MC pricing (default 90 ~ daily
+        for T=0.25-0.5y, easier to compute than hourly).
         """
         if S0 is None:
             S0 = self.current_price
@@ -1873,9 +1946,10 @@ class ElectricitySpotAsianPricer:
         def hedge_one_path(pidx: int, path_seed: int):
             S_path = outer_paths[pidx]
             sig_path = outer_sigmas[pidx]
-            # cash[i] = cash account for strip i; units[i] = forward units held
             n_s = len(strip_edges) - 1
-            cash_strips = np.zeros(n_s, dtype=float)
+            # Single cash account for the whole option position.
+            # Per-strip forward positions are tracked separately in units_strips.
+            cash = 0.0
             units_strips = np.zeros(n_s, dtype=float)
             cash_main = 0.0
             t_prev = 0.0
@@ -1912,10 +1986,7 @@ class ElectricitySpotAsianPricer:
 
                 # ---- Multi-strip hedge ----
                 if use_synthetic_forward:
-                    # Compute the near-dated strip sensitivity (most liquid strip
-                    # that is not yet fully elapsed) to cap leverage on far strips.
-                    # Far-dated strips with exp(-kappa*mid) << 1 are not genuinely
-                    # hedgeable; dividing by a tiny dF/dS explodes position size.
+                    # Compute near-dated strip sensitivity cap
                     active_sensitivities = []
                     for si in range(n_s):
                         if strip_edges[si + 1] > t:
@@ -1923,40 +1994,36 @@ class ElectricitySpotAsianPricer:
                             rel_s1_tmp = max(strip_edges[si + 1] - t, 0.0)
                             mid_tmp = 0.5 * (rel_s0_tmp + rel_s1_tmp)
                             active_sensitivities.append(float(np.exp(-kappa * mid_tmp)) if kappa > 0 else 1.0)
-                    # Max leverage = 1 / (sensitivity of the nearest active strip)
                     max_dFdS_inv = 1.0 / max(max(active_sensitivities) if active_sensitivities else 1.0, 1e-4)
 
+                    # Compute all strip positions and total forward cost
+                    h_new = np.zeros(n_s, dtype=float)
+                    F_i_vals = np.zeros(n_s, dtype=float)
                     for si in range(n_s):
                         s0e = strip_edges[si]
                         s1e = strip_edges[si + 1]
-                        # Skip strips already fully past
                         if s1e <= t:
                             continue
                         rel_s0 = max(s0e - t, 0.0)
                         rel_s1 = max(s1e - t, 0.0)
                         if rel_s1 <= 0.0:
                             continue
-                        strip_len = float(s1e - s0e)
-                        w_i = strip_len / total_delivery_len
+                        w_i = (s1e - s0e) / total_delivery_len
                         mid_i = 0.5 * (rel_s0 + rel_s1)
-                        # Analytic OU sensitivity: dF_i/dS = exp(-kappa * mid_i)
-                        dF_dS_i = float(np.exp(-kappa * mid_i)) if kappa > 0 else 1.0
-                        dF_dS_i = max(dF_dS_i, 1e-6)
-                        # Cap leverage at the near-dated strip's inverse sensitivity
-                        # to avoid explosion on far-dated unhedgeable strips
+                        dF_dS_i = max(float(np.exp(-kappa * mid_i)) if kappa > 0 else 1.0, 1e-6)
                         lev_i = min(1.0 / dF_dS_i, max_dFdS_inv)
-                        # Strip forward price
-                        F_i = self.synthetic_forward_price(
-                            S_t, sig_t, rel_s0, rel_s1, regime, use_hourly, rem_steps,
-                        )
-                        # Hedge units for this strip (leverage-capped)
-                        h_i = w_i * lev_i * delta_spot
-                        if j == 0:
-                            cash_strips[si] = w_i * p0 - h_i * F_i
-                        else:
-                            cash_strips[si] *= np.exp(r * (t - t_prev))
-                            cash_strips[si] -= (h_i - units_strips[si]) * F_i
-                        units_strips[si] = h_i
+                        F_i = self.synthetic_forward_price(S_t, sig_t, rel_s0, rel_s1, regime, use_hourly, rem_steps)
+                        h_new[si] = w_i * lev_i * delta_spot
+                        F_i_vals[si] = F_i
+
+                    if j == 0:
+                        # Collect option premium; pay for initial forward positions
+                        cash = p0 - float(np.dot(h_new, F_i_vals))
+                    else:
+                        cash *= np.exp(r * (t - t_prev))
+                        # Rebalancing: pay for change in forward positions
+                        cash -= float(np.dot(h_new - units_strips, F_i_vals))
+                    units_strips = h_new
                 else:
                     F_t = max(alpha + beta * S_t, np.finfo(float).eps)
                     h = delta_spot / max(abs(beta), 1e-8)
@@ -1977,15 +2044,14 @@ class ElectricitySpotAsianPricer:
             payoff = max(realised_avg - K, 0.0)
 
             if use_synthetic_forward:
-                # Close each strip at its realised average
-                terminal_pnl = float(np.sum(cash_strips))
+                terminal_fwd = 0.0
                 for si in range(n_s):
                     s0e = strip_edges[si]
                     s1e = strip_edges[si + 1]
                     strip_mask = (obs_times >= s0e) & (obs_times <= s1e)
                     F_T_i = float(obs_vals[strip_mask].mean()) if strip_mask.any() else realised_avg
-                    terminal_pnl += units_strips[si] * F_T_i
-                return terminal_pnl - payoff
+                    terminal_fwd += units_strips[si] * F_T_i
+                return cash + terminal_fwd - payoff
             else:
                 F_T = max(alpha + beta * float(S_path[-1]), np.finfo(float).eps)
                 return cash_main + units_strips[0] * F_T - payoff

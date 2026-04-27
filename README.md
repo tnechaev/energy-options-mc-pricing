@@ -13,7 +13,7 @@
 
 A quant research project for pricing **Asian-style options on electricity spot prices** using a jump-diffusion model with mean-reversion and stochastic volatility, regime-aware. Parameters are calibrated from 10 years of hourly German day-ahead prices (ENTSO-e/EMBER). This is a research-grade demo, actively evolving.
 
-**Current status:** Pricing and calibration are working. Hedge simulation runs but produces negative mean P&L — see [Hedging Logic](#hedging-logic) for diagnosis.
+**Current status:** Pricing and calibration are working. Number of paths for MC in hedge simulation (pricing part) is now chosen via convergence testing. However, hedge simulation still produces negative mean P&L — see [Hedging Logic](#hedging-logic) for possible reasons.
 
 ---
 
@@ -179,7 +179,7 @@ The **avg dF/dS = 0.17** confirms: the hedge instruments on average capture only
 
 ### What would improve hedge performance
 
-1. **Reduce kappa** via a longer estimation window or a different model: a slower mean-reversion rate would make dF/dS meaningfully larger for 1–3 month forwards
+1. **Reduce kappa** via a longer estimation window or a different model: a slower mean-reversion rate could make dF/dS larger for 1–3 month forwards
 2. **Gamma hedging**: add a second-order correction using the option's gamma
 3. **Shorter delivery windows**: a, e.g., 1-month Asian option should be more hedgeable than a 3-month one
 4. **More inner paths**: would reduce delta noise at the cost of runtime
@@ -190,9 +190,8 @@ The **avg dF/dS = 0.17** confirms: the hedge instruments on average capture only
 
 | Issue | Status |
 |---|---|
-| Hedge mean P&L negative | Structural — fast κ makes forwards insensitive to spot; partially mitigated by multi-strip |
-| ECB discount curve | Old data access broken with new Python; currently using discount factor = 1 |
+| Hedge mean P&L negative | Potentially model-driven: fast κ might make forwards less sensitive to spot prices; partially mitigated by multi-strip |
+| ECB discount curve | Old data access broken with new Python; currently using discount factor = 1; fixing ongoing |
 | Calibration two-pass kappa | Daily aggregation is approximate; joint MLE would be better |
 | No market-implied vol surface | Calibration is entirely historical |
-| Runtime | 20 min for full hedge simulation with 1015 outer/inner paths; convergence testing not yet implemented |
-| Convergence testing | Path counts chosen manually; adaptive convergence stopping not yet implemented |
+| Runtime | 40 min for full hedge simulation, already parallelized; try more efficient way? |
